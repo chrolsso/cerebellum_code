@@ -19,13 +19,13 @@ function fig = nifti_view(files, varargin)
 %   Space        'auto' (same matrix size -> voxel space, otherwise world), 'voxel' or 'world'.
 %                Some pipeline outputs have a slab header although they are on a cropped grid; overlays on the same grid
 %                line up in voxel space, which is what 'auto' uses.
-%   Volume       which volume of a 4D file (default 1)
+%   Volume       which volume of a 4D file to start with (default 1); in the window "," and "." step the selected layer
 %   Radiological left-right flipped as in FSLeyes' default (default true)
 %   Snapshot     file name: build the figure invisibly, save a PNG and return
 %   Hidden       true: build the figure invisibly and return its handle (for scripts and tests)
 %
 % Mouse: click = move cursor. Wheel / arrow up-down = slice of the active view (left-right: 10 slices; page up/down too).
-% Keys: [ and ] = opacity of the selected layer -/+ 0.1, g = radiological/neurological, r = auto range, s = save PNG.
+% Keys: , and . = previous / next volume of the selected layer (4D files), [ and ] = opacity of the selected layer -/+ 0.1, g = radiological/neurological, r = auto range, s = save PNG.
 
 if nargin < 1 || isempty(files), files = nifti_pick; if isempty(files), return; end, end
 if ischar(files) || isstring(files), files = cellstr(files); end
@@ -39,8 +39,9 @@ parse(ip, varargin{:}); o = ip.Results;
 tmp = tempname; cleaner = onCleanup(@() cleanup_tmp(tmp)); %#ok<NASGU>
 
 % base image defines the grid and the orientation
-[base, Ab, pix] = read_nifti(files{1}, o.Volume, tmp);
+[base, Ab, pix, nv1] = read_nifti(files{1}, o.Volume, tmp);
 [base, Ab] = deoblique(base, Ab);              % tilted slabs are shown in world space, as nilearn and FSLeyes do
+lfile = files; lnv = ones(1, numel(files)); lnv(1) = nv1; lvol = ones(1, numel(files));   % per layer: file, number of volumes, shown volume
 sz = size(base);
 M = Ab(1:3, 1:3); [~, wax] = max(abs(M), [], 1);
 if numel(unique(wax)) < 3, wax = 1:3; end
@@ -53,9 +54,9 @@ for oo = 1:3
 end
 Aras = Ab * P; vox = abs([Aras(1, 1) Aras(2, 2) Aras(3, 3)]); if any(vox == 0), vox = pix(:)'; end
 
-vols = {orient(base)}; names = {name_of(files{1})};
+lvol(1) = min(o.Volume, lnv(1)); vols = {orient(base)}; names = {lname(name_of(files{1}), lvol(1), lnv(1))};
 for q = 2:numel(files)
-    [v, nm] = place(files{q}); vols{q} = v; names{q} = nm; %#ok<AGROW>
+    [v, nm, lnv(q)] = place(files{q}, o.Volume); lvol(q) = min(o.Volume, lnv(q)); vols{q} = v; names{q} = lname(nm, lvol(q), lnv(q)); %#ok<AGROW>
 end
 n = numel(vols); dim = size(vols{1}); if numel(dim) < 3, dim(3) = 1; end
 
@@ -136,8 +137,11 @@ end
     function nm = name_of(file)
         [~, nm, ext] = fileparts(file); if strcmp(ext, '.gz'), [~, nm] = fileparts(nm); end
     end
-    function [v, nm] = place(file)
-        [v, a] = read_nifti(file, o.Volume, tmp); nm = name_of(file);
+    function nm = lname(nm, vol, nv)
+        if nv > 1, nm = sprintf('%s [%d/%d]', nm, vol, nv); end
+    end
+    function [v, nm, nvq] = place(file, vol)
+        [v, a, ~, nvq] = read_nifti(file, vol, tmp); nm = name_of(file);
         sameSize = isequal(size(v), sz); sameAff = max(abs(a(:) - Ab(:))) < 1e-3;
         mode = o.Space; if strcmp(mode, 'auto'), if sameSize, mode = 'voxel'; else, mode = 'world'; end, end
         if strcmp(mode, 'voxel')
@@ -150,9 +154,20 @@ end
         v = orient(v);
     end
     function add_layer(file)
-        [v, nm] = place(file); n = n + 1; vols{n} = v;
+        [v, nm, nvq] = place(file, o.Volume); n = n + 1; vols{n} = v;
+        lfile{n} = file; lnv(n) = nvq; lvol(n) = min(o.Volume, nvq);
         [lo, hi] = auto_range(v, false);
-        lyr(n) = newlayer(nm, 'gray', lo, hi, 1, true); sel = n; lastdir = fileparts(file); refresh_all();
+        lyr(n) = newlayer(lname(nm, lvol(n), nvq), 'gray', lo, hi, 1, true); sel = n; lastdir = fileparts(file); refresh_all();
+    end
+    function setvol(d)                                  % previous / next volume of the selected layer's 4D file
+        k = sel; nv = lnv(k); newv = max(1, min(nv, lvol(k) + d));
+        if nv < 2 || newv == lvol(k), return; end
+        if strcmp(lfile{k}, files{1})                   % same file as the base: keep the base grid (deobliqued)
+            [b, ab] = read_nifti(lfile{k}, newv, tmp); b = deoblique(b, ab); vols{k} = orient(b); nm = name_of(lfile{k});
+        else
+            [vols{k}, nm] = place(lfile{k}, newv);
+        end
+        lvol(k) = newv; lyr(k).name = lname(nm, newv, nv); refresh_all();
     end
     function select_layer(k), sel = k; refresh_all(); end
     function s = list_strings()
@@ -224,7 +239,9 @@ end
             case 'r', autocb();
             case 's', savepng();
             otherwise
-                if strcmp(e.Character, '['), lyr(sel).alpha = max(0, round((lyr(sel).alpha - 0.1) * 100) / 100); refresh_all();
+                if strcmp(e.Character, ','), setvol(-1);
+                elseif strcmp(e.Character, '.'), setvol(1);
+                elseif strcmp(e.Character, '['), lyr(sel).alpha = max(0, round((lyr(sel).alpha - 0.1) * 100) / 100); refresh_all();
                 elseif strcmp(e.Character, ']'), lyr(sel).alpha = min(1, round((lyr(sel).alpha + 0.1) * 100) / 100); refresh_all(); end
         end
     end
@@ -240,11 +257,12 @@ end
     end
     function delcb()
         if n <= 1, return; end
-        vols(sel) = []; lyr(sel) = []; n = n - 1; sel = min(sel, n); refresh_all();
+        vols(sel) = []; lyr(sel) = []; lfile(sel) = []; lnv(sel) = []; lvol(sel) = []; n = n - 1; sel = min(sel, n); refresh_all();
     end
     function movecb(d)
         k = sel + d; if k < 1 || k > n, return; end
-        vols([sel k]) = vols([k sel]); lyr([sel k]) = lyr([k sel]); sel = k; refresh_all();
+        vols([sel k]) = vols([k sel]); lyr([sel k]) = lyr([k sel]); lfile([sel k]) = lfile([k sel]);
+        lnv([sel k]) = lnv([k sel]); lvol([sel k]) = lvol([k sel]); sel = k; refresh_all();
     end
     function cmapcb(), items = get(hcmap, 'String'); lyr(sel).cmap = items{get(hcmap, 'Value')}; refresh_all(); end
     function rangecb()
@@ -305,10 +323,10 @@ for k = 1:sz(3)
 end
 end
 
-function [data, A, pixdim] = read_nifti(file, vol, tmp)
+function [data, A, pixdim, nvol] = read_nifti(file, vol, tmp)
 if ~exist(file, 'file'), error('File not found: %s', file); end
 if endsWith(lower(file), {'.mgz', '.mgh'})
-    [data, A, pixdim] = read_mgh(file, vol, tmp); return
+    [data, A, pixdim, nvol] = read_mgh(file, vol, tmp); return
 end
 if numel(file) > 3 && strcmpi(file(end - 2:end), '.gz')
     if ~exist(tmp, 'dir'), mkdir(tmp); end
@@ -328,7 +346,7 @@ types = containers.Map({2, 4, 8, 16, 64, 256, 512, 768, 1024, 1280}, {'uint8', '
 if ~isKey(types, double(dt)), error('Unsupported NIfTI datatype %d in %s', dt, file); end
 prec = types(double(dt)); nd = dim(1); d3 = dim(2:4)'; d3(d3 < 1) = 1;
 bytes = struct('uint8', 1, 'int8', 1, 'int16', 2, 'uint16', 2, 'int32', 4, 'uint32', 4, 'single', 4, 'int64', 8, 'uint64', 8, 'double', 8);
-vol = max(1, min(vol, max(1, dim(5) * (nd >= 4)))); fseek(fid, voxoff + (vol - 1) * prod(d3) * bytes.(prec), 'bof');
+nvol = max(1, dim(5) * (nd >= 4)); vol = max(1, min(vol, nvol)); fseek(fid, voxoff + (vol - 1) * prod(d3) * bytes.(prec), 'bof');
 raw = fread(fid, prod(d3), [prec '=>single'], 0, fmt);
 data = reshape(raw, d3); if slope ~= 0 && ~(slope == 1 && inter == 0), data = data * single(slope) + single(inter); end
 if scode > 0, A = [sx'; sy'; sz'; 0 0 0 1];
@@ -342,7 +360,7 @@ end
 pixdim = pixdim(2:4);
 end
 
-function [data, A, pixdim] = read_mgh(file, vol, tmp)       % FreeSurfer .mgh / .mgz: big-endian, 284-byte header
+function [data, A, pixdim, nvol] = read_mgh(file, vol, tmp) % FreeSurfer .mgh / .mgz: big-endian, 284-byte header
 if endsWith(lower(file), '.mgz')
     if ~exist(tmp, 'dir'), mkdir(tmp); end
     copyfile(file, fullfile(tmp, 'x.gz')); f = gunzip(fullfile(tmp, 'x.gz'), tmp); file = f{1};   % gunzip wants a .gz name
@@ -350,7 +368,7 @@ end
 fid = fopen(file, 'r', 'b');
 hdr = fread(fid, 7, 'int32'); dim = hdr(2:4)'; nfr = hdr(5); type = hdr(6);
 fread(fid, 1, 'int16');                                      % goodRASflag
-pixdim = fread(fid, 3, 'float32')'; M = reshape(fread(fid, 9, 'float32'), 3, 3); c = fread(fid, 3, 'float32');
+nvol = max(1, nfr); pixdim = fread(fid, 3, 'float32')'; M =reshape(fread(fid, 9, 'float32'), 3, 3); c = fread(fid, 3, 'float32');
 types = {0, 'uint8'; 1, 'int32'; 3, 'single'; 4, 'int16'}; prec = types{[types{:, 1}] == type, 2};
 bytes = struct('uint8', 1, 'int32', 4, 'single', 4, 'int16', 2);
 fseek(fid, 284 + (min(vol, nfr) - 1) * prod(dim) * bytes.(prec), 'bof');
