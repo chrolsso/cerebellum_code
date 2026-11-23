@@ -25,7 +25,11 @@ function fig = nifti_view(files, varargin)
 %   Hidden       true: build the figure invisibly and return its handle (for scripts and tests)
 %
 % Mouse: click = move cursor. Wheel / arrow up-down = slice of the active view (left-right: 10 slices; page up/down too).
+%   Zoom: Ctrl + wheel (around the mouse pointer) or + / - keys (around the cursor). Pan: drag with the right or middle button.
+%   Double-click or z = reset the zoom (double-click: that view only).
 % Keys: , and . = previous / next volume of the selected layer (4D files), [ and ] = opacity of the selected layer -/+ 0.1, g = radiological/neurological, r = auto range, s = save PNG.
+%   p or space = play / pause the volumes of the selected layer as a movie, < and > = slower / faster. The slider under the
+%   layer list scrubs through the volumes. Visited volumes are kept in memory (up to about 2 GB), so a second pass is fast.
 
 if nargin < 1 || isempty(files), files = nifti_pick; if isempty(files), return; end, end
 if ischar(files) || isstring(files), files = cellstr(files); end
@@ -85,6 +89,9 @@ else
     end
 end
 cur = max(1, min(dim, cur)); sel = 1; act = 3; radio = o.Radiological; lastdir = fileparts(files{1});
+zl = cell(1, 3); panning = 0; pan0 = [0 0];         % zoom limits per view ([] = whole image), view being panned, pan start point
+playing = false; fps = 5;                           % movie state
+cache = containers.Map('KeyType', 'char', 'ValueType', 'any'); cachebytes = 0;   % volumes of 4D files already read
 
 % figure
 fig = figure('Name', 'nifti_view', 'NumberTitle', 'off', 'Color', 'k', 'MenuBar', 'none', 'ToolBar', 'none', ...
@@ -122,7 +129,10 @@ hvis = mk('checkbox', [0.27 0.075 0.06 0.04], 'show', @(~, ~) viscb()); hclip = 
 mk('pushbutton', [0.27 0.015 0.06 0.045], 'auto', @(~, ~) autocb()); mk('pushbutton', [0.335 0.015 0.06 0.045], 'PNG', @(~, ~) savepng());
 hinfo = uicontrol(fig, 'Style', 'text', 'Units', 'normalized', 'Position', [0.52 0.02 0.46 0.28], 'String', '', ...
     'BackgroundColor', 'k', 'ForegroundColor', [0.8 1 0.8], 'HorizontalAlignment', 'left', 'FontName', 'Courier New', 'FontSize', 10);
-set(fig, 'KeyPressFcn', @key, 'WindowScrollWheelFcn', @wheel, 'WindowButtonMotionFcn', @hover);
+hvolsl = mk('slider', [0.02 0.303 0.48 0.032], '', @(~, ~) volslidercb());
+set(hvolsl, 'Min', 1, 'Max', 2, 'Value', 1, 'Enable', 'off');
+try, addlistener(hvolsl, 'ContinuousValueChange', @(~, ~) volslidercb()); catch, end   % follow the slider while it is dragged
+set(fig, 'KeyPressFcn', @key, 'WindowScrollWheelFcn', @wheel, 'WindowButtonMotionFcn', @hover, 'WindowButtonUpFcn', @release);
 setappdata(fig, 'addLayer', @add_layer); setappdata(fig, 'selectLayer', @(k) select_layer(k));
 refresh_all();
 
@@ -159,15 +169,27 @@ end
         [lo, hi] = auto_range(v, false);
         lyr(n) = newlayer(lname(nm, lvol(n), nvq), 'gray', lo, hi, 1, true); sel = n; lastdir = fileparts(file); refresh_all();
     end
-    function setvol(d)                                  % previous / next volume of the selected layer's 4D file
-        k = sel; nv = lnv(k); newv = max(1, min(nv, lvol(k) + d));
+    function setvol(d), setvol_to(sel, lvol(sel) + d); end   % previous / next volume of the selected layer's 4D file
+    function setvol_to(k, newv)
+        nv = lnv(k); newv = max(1, min(nv, round(newv)));
         if nv < 2 || newv == lvol(k), return; end
-        if strcmp(lfile{k}, files{1})                   % same file as the base: keep the base grid (deobliqued)
-            [b, ab] = read_nifti(lfile{k}, newv, tmp); b = deoblique(b, ab); vols{k} = orient(b); nm = name_of(lfile{k});
-        else
-            [vols{k}, nm] = place(lfile{k}, newv);
-        end
+        remember(k); [vols{k}, nm] = getvol(k, newv);
         lvol(k) = newv; lyr(k).name = lname(nm, newv, nv); refresh_all();
+    end
+    function key = cachekey(k, q), key = sprintf('%d|%d|%s', strcmp(lfile{k}, files{1}), q, lfile{k}); end
+    function remember(k)                                 % keep the volume that is shown now, so stepping back is instant
+        key = cachekey(k, lvol(k));
+        if ~isKey(cache, key) && cachebytes + 4 * numel(vols{k}) < 2e9, cache(key) = vols{k}; cachebytes = cachebytes + 4 * numel(vols{k}); end
+    end
+    function [v, nm] = getvol(k, q)                      % oriented volume q of layer k's file, from the cache if read before
+        key = cachekey(k, q); nm = name_of(lfile{k});
+        if isKey(cache, key), v = cache(key); return, end
+        if strcmp(lfile{k}, files{1})                    % same file as the base: keep the base grid (deobliqued)
+            [b, ab] = read_nifti(lfile{k}, q, tmp); b = deoblique(b, ab); v = orient(b);
+        else
+            [v, nm] = place(lfile{k}, q);
+        end
+        if cachebytes + 4 * numel(v) < 2e9, cache(key) = v; cachebytes = cachebytes + 4 * numel(v); end
     end
     function select_layer(k), sel = k; refresh_all(); end
     function s = list_strings()
@@ -197,11 +219,7 @@ end
             end
             if isempty(rgb), rgb = zeros(numel(ys{v}), numel(xs{v}), 3); end
             set(him(v), 'CData', rgb, 'XData', [xs{v}(1) xs{v}(end)], 'YData', [ys{v}(1) ys{v}(end)]);
-            sx = {vox(2), vox(1), vox(1)}; sy = {vox(3), vox(3), vox(2)};
-            set(ax(v), 'XLim', [xs{v}(1) - sx{v} / 2, xs{v}(end) + sx{v} / 2], 'YLim', [ys{v}(1) - sy{v} / 2, ys{v}(end) + sy{v} / 2]);
-            px = {cur(2) - 1, cur(1) - 1, cur(1) - 1}; py = {cur(3) - 1, cur(3) - 1, cur(2) - 1};
-            X = px{v} * sx{v}; Y = py{v} * sy{v};
-            set(hl(1, v), 'XData', [X X], 'YData', get(ax(v), 'YLim')); set(hl(2, v), 'XData', get(ax(v), 'XLim'), 'YData', [Y Y]);
+            apply_limits(v);
             if v == 1, set(ax(v), 'XDir', 'normal'); else, if radio, set(ax(v), 'XDir', 'reverse'); else, set(ax(v), 'XDir', 'normal'); end, end
             if v == 1, l = 'P'; r = 'A'; else, if radio, l = 'R'; r = 'L'; else, l = 'L'; r = 'R'; end, end
             if v == 3, t = 'A'; b = 'P'; else, t = 'S'; b = 'I'; end
@@ -212,13 +230,73 @@ end
         set(hlo, 'String', num2str(L.lo)); set(hhi, 'String', num2str(L.hi));
         set(halpha, 'Value', L.alpha); set(halphaval, 'String', sprintf('%.2f', L.alpha));
         set(hvis, 'Value', L.vis); set(hclip, 'Value', L.clip);
+        mx = max(2, lnv(sel));                           % volume slider of the selected layer
+        if get(hvolsl, 'Max') ~= mx, set(hvolsl, 'Value', 1, 'Max', mx); end
+        onoff = {'off', 'on'};
+        set(hvolsl, 'SliderStep', [1 / (mx - 1), min(1, 10 / (mx - 1))], 'Enable', onoff{1 + (lnv(sel) >= 2)});
+        if round(get(hvolsl, 'Value')) ~= lvol(sel), set(hvolsl, 'Value', lvol(sel)); end
         f = P * [cur(:) - 1; 1]; fv = round(f(1:3)' + 1); w = Aras * [cur(:) - 1; 1];
         str = {sprintf('voxel (file order) [%d %d %d]   world [%.1f %.1f %.1f] mm', fv, w(1:3))};
         for k = 1:n, str{end + 1} = sprintf('%-30s %g', lyr(k).name, vols{k}(cur(1), cur(2), cur(3))); end %#ok<AGROW>
+        if lnv(sel) > 1, str{end + 1} = sprintf('volume %d/%d of the selected layer   p = play (%.1f/s), < > = speed', lvol(sel), lnv(sel), fps); end
         set(hinfo, 'String', str);
     end
+    function L = fulllim(v)                              % whole extent of view v: [xmin xmax; ymin ymax]
+        e = {[dim(2) dim(3)], [dim(1) dim(3)], [dim(1) dim(2)]};
+        s = {[vox(2) vox(3)], [vox(1) vox(3)], [vox(1) vox(2)]};
+        L = [-s{v}(1) / 2, (e{v}(1) - 1) * s{v}(1) + s{v}(1) / 2; -s{v}(2) / 2, (e{v}(2) - 1) * s{v}(2) + s{v}(2) / 2];
+    end
+    function xy = cursor_xy(v)                           % position of the cursor in the axes of view v (mm)
+        px = {cur(2) - 1, cur(1) - 1, cur(1) - 1}; py = {cur(3) - 1, cur(3) - 1, cur(2) - 1};
+        sx = {vox(2), vox(1), vox(1)}; sy = {vox(3), vox(3), vox(2)};
+        xy = [px{v} * sx{v}, py{v} * sy{v}];
+    end
+    function apply_limits(v)                             % show the zoomed part (or everything) of view v and place its cursor lines
+        if isempty(zl{v}), L = fulllim(v); else, L = zl{v}; end
+        set(ax(v), 'XLim', L(1, :), 'YLim', L(2, :));
+        xy = cursor_xy(v); xl = get(ax(v), 'XLim'); yl = get(ax(v), 'YLim');
+        set(hl(1, v), 'XData', [xy(1) xy(1)], 'YData', yl); set(hl(2, v), 'XData', xl, 'YData', [xy(2) xy(2)]);
+    end
+    function zoom_view(v, p, f)                          % zoom view v by the factor f (> 1 = in) around the point p = [x y]
+        L = [get(ax(v), 'XLim'); get(ax(v), 'YLim')]; F = fulllim(v);
+        if any(p < L(:, 1)') || any(p > L(:, 2)'), p = mean(L, 2)'; end
+        L = p' + (L - p') / f;
+        if all(diff(L, 1, 2) >= diff(F, 1, 2) - eps), zl{v} = []; else, zl{v} = L; end
+        apply_limits(v);
+    end
+    function dopan()
+        v = panning; pt = get(ax(v), 'CurrentPoint'); d = pan0 - pt(1, 1:2);
+        zl{v} = [get(ax(v), 'XLim'); get(ax(v), 'YLim')] + [d(1) d(1); d(2) d(2)]; apply_limits(v);
+    end
+    function release(~, ~), panning = 0; end
+    function reset_zoom()
+        zl = cell(1, 3); for v = 1:3, apply_limits(v); end
+    end
+    function toggle_play()
+        if playing, playing = false; return, end
+        k = sel; if lnv(k) < 2, return, end
+        playing = true;                                  % also set while reading, so a second press cancels
+        remember(k); wb = waitbar(0, 'reading the volumes (once) ...');
+        for q = 1:lnv(k)
+            if ~playing, break; end
+            getvol(k, q); if isvalid(wb), waitbar(q / lnv(k), wb); end
+        end
+        if isvalid(wb), close(wb); end
+        if ~playing, return; end
+        while playing && isvalid(fig)
+            t0 = tic; setvol_to(k, mod(lvol(k), lnv(k)) + 1);
+            drawnow limitrate; pause(max(0.001, 1 / fps - toc(t0)));
+        end
+        playing = false;
+    end
+    function volslidercb(), setvol_to(sel, get(hvolsl, 'Value')); end
     function click(v)
-        pt = get(ax(v), 'CurrentPoint'); x = pt(1, 1); y = pt(1, 2); act = v;
+        act = v; st = get(fig, 'SelectionType');
+        if strcmp(st, 'open'), zl{v} = []; apply_limits(v); return, end              % double-click: reset the zoom of this view
+        if strcmp(st, 'alt') || strcmp(st, 'extend')                                  % right or middle button: drag = move the image
+            pt = get(ax(v), 'CurrentPoint'); pan0 = pt(1, 1:2); panning = v; return
+        end
+        pt = get(ax(v), 'CurrentPoint'); x = pt(1, 1); y = pt(1, 2);
         switch v
             case 1, cur(2) = round(x / vox(2)) + 1; cur(3) = round(y / vox(3)) + 1;
             case 2, cur(1) = round(x / vox(1)) + 1; cur(3) = round(y / vox(3)) + 1;
@@ -236,17 +314,28 @@ end
             case 'rightarrow', step(10);
             case 'leftarrow', step(-10);
             case 'g', radio = ~radio; set(hrad, 'Value', radio); refresh_all();
+            case 'z', reset_zoom();
+            case {'p', 'space'}, toggle_play();
             case 'r', autocb();
             case 's', savepng();
             otherwise
                 if strcmp(e.Character, ','), setvol(-1);
                 elseif strcmp(e.Character, '.'), setvol(1);
                 elseif strcmp(e.Character, '['), lyr(sel).alpha = max(0, round((lyr(sel).alpha - 0.1) * 100) / 100); refresh_all();
-                elseif strcmp(e.Character, ']'), lyr(sel).alpha = min(1, round((lyr(sel).alpha + 0.1) * 100) / 100); refresh_all(); end
+                elseif strcmp(e.Character, ']'), lyr(sel).alpha = min(1, round((lyr(sel).alpha + 0.1) * 100) / 100); refresh_all();
+                elseif any(strcmp(e.Character, {'+', '='})), zoom_view(act, cursor_xy(act), 1.25);
+                elseif strcmp(e.Character, '-'), zoom_view(act, cursor_xy(act), 1 / 1.25);
+                elseif strcmp(e.Character, '>'), fps = min(60, fps * 1.5); refresh_all();
+                elseif strcmp(e.Character, '<'), fps = max(0.5, fps / 1.5); refresh_all(); end
         end
     end
-    function wheel(~, e), step(-e.VerticalScrollCount); end
+    function wheel(~, e)
+        if any(strcmp(get(fig, 'CurrentModifier'), 'control'))      % Ctrl + wheel: zoom around the mouse pointer
+            pt = get(ax(act), 'CurrentPoint'); zoom_view(act, pt(1, 1:2), 1.25 ^ (-e.VerticalScrollCount));
+        else, step(-e.VerticalScrollCount); end
+    end
     function hover(~, ~)
+        if panning, dopan(); return, end
         fp = get(fig, 'Position'); p = get(fig, 'CurrentPoint') ./ fp(3:4);
         for v = 1:3, q = pos{v}; if p(1) >= q(1) && p(1) <= q(1) + q(3) && p(2) >= q(2) && p(2) <= q(2) + q(4), act = v; end, end
     end
@@ -257,10 +346,12 @@ end
     end
     function delcb()
         if n <= 1, return; end
+        playing = false;
         vols(sel) = []; lyr(sel) = []; lfile(sel) = []; lnv(sel) = []; lvol(sel) = []; n = n - 1; sel = min(sel, n); refresh_all();
     end
     function movecb(d)
         k = sel + d; if k < 1 || k > n, return; end
+        playing = false;
         vols([sel k]) = vols([k sel]); lyr([sel k]) = lyr([k sel]); lfile([sel k]) = lfile([k sel]);
         lnv([sel k]) = lnv([k sel]); lvol([sel k]) = lvol([k sel]); sel = k; refresh_all();
     end
@@ -324,13 +415,19 @@ end
 end
 
 function [data, A, pixdim, nvol] = read_nifti(file, vol, tmp)
+persistent unz                                                   % .gz files already unpacked, so a volume step does not unpack again
+if isempty(unz), unz = containers.Map('KeyType', 'char', 'ValueType', 'char'); end
 if ~exist(file, 'file'), error('File not found: %s', file); end
 if endsWith(lower(file), {'.mgz', '.mgh'})
     [data, A, pixdim, nvol] = read_mgh(file, vol, tmp); return
 end
 if numel(file) > 3 && strcmpi(file(end - 2:end), '.gz')
-    if ~exist(tmp, 'dir'), mkdir(tmp); end
-    f = gunzip(file, tmp); file = f{1};
+    if isKey(unz, file) && exist(unz(file), 'file'), file = unz(file);
+    else
+        if ~exist(tmp, 'dir'), mkdir(tmp); end
+        sub = tempname(tmp); mkdir(sub);                         % own folder per file, so equal file names cannot overwrite each other
+        f = gunzip(file, sub); unz(file) = f{1}; file = f{1};
+    end
 end
 fid = fopen(file, 'r'); if fid < 0, error('Cannot open %s', file); end
 c = onCleanup(@() fclose(fid));
